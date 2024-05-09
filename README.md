@@ -16,6 +16,7 @@ In `BloodHound` output mode:
  * Groups collection
  * Computers collection
  * Trusts collection (as visible from the LDAP DC you are connected to)
+ * Certificate template collection
 
 In `Objects` output mode, all attributes for every object are parsed and outputted to NDJSON format.
 
@@ -56,9 +57,14 @@ optional arguments:
 
 ![ADExplorerSnapshot.py](meta/adexpsnapshotpy.png)
 
+Certificate templates can be imported in [BloodHound](https://github.com/BloodHoundAD/BloodHound) format or [BloodHound-ly4k](https://github.com/ly4k/BloodHound) format.
+If you use the regular BloodHound version you should only import the `cert_bh` JSON file (which are imported as GPOs). 
+If you use ly4k's fork, you should import the `cert_ly4k` files instead. Some information will be omitted (e.g. for ESC8 whether Web Enrollment is enabled) as it cannot be collected with AD Explorer.
+
 ## Notes
 
-This library is now supporting the BloodHound v4.1+ output format (JSON format v4). For the old v3 output format, you can use the code in the [v3-format branch](https://github.com/c3c/ADExplorerSnapshot.py/tree/v3-format).
+This library is now supporting the BloodHound v4.2+ output format (JSON format v4). Version 4.1 and below are no longer supported.
+For the old v3 output format, you can use the code in the [v3-format branch](https://github.com/c3c/ADExplorerSnapshot.py/tree/v3-format).
 
 Making snapshots in AD Explorer is more network-intensive than the traditional BloodHound ingestors as it attempts to retrieve all objects it can from the LDAP.
 
@@ -70,6 +76,12 @@ The AD Explorer snapshot parser is implemented as its own module, which could al
 
 The format in which snapshots are stored by AD Explorer is proprietary and led to a fun reverse engineering journey. A 010 editor template is included in this repository, which I used for iteratively mapping out the contents of the snapshot into structs.
 
+## OPSEC and detection
+
+On an OPSEC-related note, AD Explorer is a legitimate Microsoft tool. When performing a snapshot, only limited queries are made to the LDAP server `(objectGuid=*)`. However, the resultset is huge as all objects and their associated attributes are retrieved. This results in a rather voluminous output. 
+
+Detection of this tool is possible in multiple ways, for which I refer to the excellent blog post by FalconForce: [FalconFriday — Detecting Active Directory Data Collection — 0xFF21](https://falconforce.nl/falconfriday-detecting-active-directory-data-collection-0xff21/).
+
 ## License and credits
 
 This code is licensed under the [MIT license](https://opensource.org/licenses/MIT) and makes use of code that is also licensed under the MIT license.
@@ -77,8 +89,11 @@ This code is licensed under the [MIT license](https://opensource.org/licenses/MI
 ADExplorerSnapshot.py relies on the following projects:
  - [BloodHound.py](https://github.com/fox-it/BloodHound.py) (the Python BloodHound ingestor): for processing LDAP data.
  - [dissect.cstruct](https://github.com/fox-it/dissect.cstruct) (C-style binary struct parser): for parsing the binary snapshot data.
+ - [certipy](https://github.com/ly4k/Certipy) (ADCS enumeration tool): for processing certificate template information.
 
 Credits:
- - Cedric Van Bockhaven (Deloitte) for implementation
- - Marat Nigmatullin (Deloitte) for the idea
- 
+ - Cedric Van Bockhaven for implementation
+ - Marat Nigmatullin for the idea
+ - The FalconForce team for adding certificate template support
+
+Thanks to Deloitte for providing the environment in which this tool was developed.

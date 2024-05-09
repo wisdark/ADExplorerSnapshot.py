@@ -1,4 +1,3 @@
-from adexpsnapshot.parser.classes import Snapshot
 from requests.structures import CaseInsensitiveDict
 
 import pwnlib.log, pwnlib.term, logging
@@ -15,18 +14,30 @@ from bloodhound.ad.structures import LDAP_SID
 from frozendict import frozendict
 from bloodhound.enumeration.outputworker import OutputWorker
 
+from certipy.lib.constants import *
+from certipy.lib.security import ActiveDirectorySecurity, CertifcateSecurity as CertificateSecurity, CASecurity
+from certipy.commands.find import filetime_to_str
+from asn1crypto import x509
+
+from collections import defaultdict
 import functools
 import queue, threading
-import calendar, datetime
+import datetime
 from enum import Enum
+from typing import List
 
 class ADExplorerSnapshot(object):
     OutputMode = Enum('OutputMode', ['BloodHound', 'Objects'])
 
-    def __init__(self, snapfile, outputfolder, log=None):
+    def __init__(self, snapfile, outputfolder, log=None, snapshot_parser=None):
         self.log = log
         self.output = outputfolder
-        self.snap = Snapshot(snapfile, log=log)
+
+        if not snapshot_parser:
+            from adexpsnapshot.parser.classes import Snapshot
+            snapshot_parser = Snapshot
+
+        self.snap = snapshot_parser(snapfile, log=log)
 
         self.snap.parseHeader()
 
@@ -48,6 +59,7 @@ class ADExplorerSnapshot(object):
         self.objecttype_guid_map = CaseInsensitiveDict()
         self.domaincontrollers = []
         self.rootdomain = None
+        self.certtemplates = defaultdict(set)
 
     def outputObjects(self):
         import codecs, json, base64
@@ -120,6 +132,9 @@ class ADExplorerSnapshot(object):
         self.numGroups = 0
         self.numComputers = 0
         self.numTrusts = 0
+        self.numCertTemplates = 0
+        self.numCAs = 0
+
         self.trusts = []
         self.writeQueues = {}
 
@@ -146,6 +161,7 @@ class ADExplorerSnapshot(object):
             self.domains = dico['domains']
             self.domaincontrollers = dico['domaincontrollers']
             self.rootdomain = dico['rootdomain']
+            self.certtemplates = dico['certtemplates']
         else:
             self.preprocess()
 
@@ -157,8 +173,8 @@ class ADExplorerSnapshot(object):
             dico['domains'] = self.domains
             dico['domaincontrollers'] = self.domaincontrollers
             dico['rootdomain'] = self.rootdomain
+            dico['certtemplates'] = self.certtemplates
             dico['shelved'] = True
-
             Pickler(open(cachePath, "wb")).dump(dico)
 
     # build caches: guidmap, domains, forest_domains, computers
@@ -201,10 +217,18 @@ class ADExplorerSnapshot(object):
                         self.domains[ncname] = idx
 
             # get computers
-            if ADUtils.get_entry_property(obj, 'sAMAccountType', -1) == 805306369 and not (ADUtils.get_entry_property(obj, 'userAccountControl', 0) & 0x02 == 0x02):
+            if ADUtils.get_entry_property(obj, 'sAMAccountType', -1) == 805306369:
                 dnshostname = ADUtils.get_entry_property(obj, 'dNSHostname')
                 if dnshostname:
                     self.computersidcache[dnshostname] = objectSid
+
+            # get all cert templates
+            if 'pkienrollmentservice' in obj.classes:
+                name = ADUtils.get_entry_property(obj, 'name')
+                if ADUtils.get_entry_property(obj, 'certificateTemplates'):
+                    templates = ADUtils.get_entry_property(obj, 'certificateTemplates')
+                    for template in templates:
+                        self.certtemplates[template].add(name)
 
             # get dcs
             if ADUtils.get_entry_property(obj, 'userAccountControl', 0) & 0x2000 == 0x2000:
@@ -224,29 +248,39 @@ class ADExplorerSnapshot(object):
         if self.log:
             prog = self.log.progress("Collecting data", rate=0.1)
 
-        for ptype in ['users', 'computers', 'groups', 'domains']:
+        for ptype in ['users', 'computers', 'groups', 'domains', 'cert_bh', 'cert_ly4k_tpls', 'cert_ly4k_cas']:
             self.writeQueues[ptype] = queue.Queue()
-            results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.writeQueues[ptype], ptype, os.path.join(self.output, f"{self.snap.header.server}_{self.snap.header.filetimeUnix}_{ptype}.json")))
+            btype = ptype
+
+            if ptype.startswith("cert_"):
+                if ptype.endswith("bh"):
+                    btype = "gpos"
+                elif ptype.endswith("ly4k_tpls"):
+                    btype = "templates"
+                elif ptype.endswith("ly4k_cas"):
+                    btype = "cas"
+            
+            results_worker = threading.Thread(target=OutputWorker.membership_write_worker, args=(self.writeQueues[ptype], btype, os.path.join(self.output, f"{self.snap.header.server}_{self.snap.header.filetimeUnix}_{ptype}.json")))
             results_worker.daemon = True
             results_worker.start()
 
         for idx,obj in enumerate(self.snap.objects):
-            for fun in [self.processUsers, self.processComputers, self.processGroups, self.processTrusts]:
+            for fun in [self.processUsers, self.processComputers, self.processGroups, self.processTrusts, self.processCertTemplates, self.processCAs]:
                 ret = fun(obj)
                 if ret:
                     break
 
             if self.log and self.log.term_mode:
-                prog.status(f"{idx+1}/{self.snap.header.numObjects} ({self.numUsers} users, {self.numGroups} groups, {self.numComputers} computers, {self.numTrusts} trusts)")
+                prog.status(f"{idx+1}/{self.snap.header.numObjects} ({self.numUsers} users, {self.numGroups} groups, {self.numComputers} computers, {self.numCertTemplates} certtemplates, {self.numCAs} CAs, {self.numTrusts} trusts)")
 
         if self.log:
-            prog.success(f"{self.numUsers} users, {self.numGroups} groups, {self.numComputers} computers, {self.numTrusts} trusts")
+            prog.success(f"{self.numUsers} users, {self.numGroups} groups, {self.numComputers} computers, {self.numCertTemplates} certtemplates, {self.numCAs} CAs, {self.numTrusts} trusts")
 
         self.write_default_users()
         self.write_default_groups()
         self.processDomains()
 
-        for ptype in ['users', 'computers', 'groups', 'domains']:
+        for ptype in ['users', 'computers', 'groups', 'domains', 'cert_bh', 'cert_ly4k_tpls', 'cert_ly4k_cas']:
             self.writeQueues[ptype].put(None)
             self.writeQueues[ptype].join()
 
@@ -254,7 +288,7 @@ class ADExplorerSnapshot(object):
             self.log.success(f"Output written to {self.snap.header.server}_{self.snap.header.filetimeUnix}_*.json files")
 
     def processDomains(self):
-        level_id = ADUtils.get_entry_property(self.domain_object, 'msds-behavior-version')
+        level_id = ADUtils.get_entry_property(self.domain_object, 'msds-behavior-version', -1)
         try:
             functional_level = ADUtils.FUNCTIONAL_LEVELS[int(level_id)]
         except KeyError:
@@ -267,8 +301,9 @@ class ADExplorerSnapshot(object):
                 "domain": self.domainname.upper(),
                 "domainsid": ADUtils.get_entry_property(self.domain_object, 'objectSid'),
                 "distinguishedname": ADUtils.get_entry_property(self.domain_object, 'distinguishedName'),
-                "description": ADUtils.get_entry_property(self.domain_object, 'description'),
+                "description": ADUtils.get_entry_property(self.domain_object, 'description', ''),
                 "functionallevel": functional_level,
+                "highvalue": True,
                 "whencreated": ADUtils.get_entry_property(self.domain_object, 'whencreated', default=0)
             },
             "Trusts": [],
@@ -293,12 +328,13 @@ class ADExplorerSnapshot(object):
         self.writeQueues["domains"].put(domain)
 
     def processComputers(self, entry):
-        if not ADUtils.get_entry_property(entry, 'sAMAccountType', -1) == 805306369 or (ADUtils.get_entry_property(entry, 'userAccountControl', 0) & 0x02 == 0x02):
+        if not ADUtils.get_entry_property(entry, 'sAMAccountType', -1) == 805306369:
             return
 
         hostname = ADUtils.get_entry_property(entry, 'dNSHostName')
         if not hostname:
-            return
+            resolved_entry = ADUtils.resolve_ad_entry(entry)
+            hostname = resolved_entry['principal']
 
         distinguishedName = ADUtils.get_entry_property(entry, 'distinguishedName')
 
@@ -366,6 +402,7 @@ class ADExplorerSnapshot(object):
         props['unconstraineddelegation'] = ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x00080000 == 0x00080000
         props['enabled'] = ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 2 == 0
         props['trustedtoauth'] = ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x01000000 == 0x01000000
+        props['samaccountname'] = ADUtils.get_entry_property(entry, 'sAMAccountName')
 
         props['haslaps'] = ADUtils.get_entry_property(entry, 'ms-mcs-admpwdexpirationtime', 0) != 0
 
@@ -403,7 +440,7 @@ class ADExplorerSnapshot(object):
                 logging.warning('Invalid delegation target: %s', host)
                 continue
             try:
-                sid = self.computersidcache.get(target)
+                sid = self.computersidcache[target]
                 computer['AllowedToDelegate'].append(sid)
             except KeyError:
                 if '.' in target:
@@ -429,6 +466,184 @@ class ADExplorerSnapshot(object):
         self.writeQueues["computers"].put(computer)
         return True
 
+    def processCertTemplates(self, entry):
+        if not 'pkicertificatetemplate' in entry.classes:
+            return
+
+        name = ADUtils.get_entry_property(entry, 'name')
+        if not name:
+            return
+
+        # Enable check if cert is under any CA (e.g. enabled)
+        enabled = name in self.certtemplates
+
+        object_identifier = ADUtils.get_entry_property(entry, 'objectGUID')
+        validity_period = filetime_to_str(ADUtils.get_entry_property(entry, 'pKIExpirationPeriod'))
+        renewal_period = filetime_to_str(ADUtils.get_entry_property(entry, 'pKIOverlapPeriod'))
+        
+        certificate_name_flag = ADUtils.get_entry_property(entry, 'msPKI-Certificate-Name-Flag', 0)
+        certificate_name_flag = MS_PKI_CERTIFICATE_NAME_FLAG(int(certificate_name_flag))
+
+        enrollment_flag = ADUtils.get_entry_property(entry, 'msPKI-Enrollment-Flag', 0)
+        enrollment_flag = MS_PKI_ENROLLMENT_FLAG(int(enrollment_flag))
+
+        authorized_signatures_required = int(ADUtils.get_entry_property(entry, 'msPKI-RA-Signature', 0))
+
+        application_policies = ADUtils.get_entry_property(entry, 'msPKI-RA-Application-Policies', raw=True, default=[])
+        application_policies = list(
+            map(
+                lambda x: OID_TO_STR_MAP[x] if x in OID_TO_STR_MAP else x,
+                application_policies,
+            )
+        )
+
+        extended_key_usage = ADUtils.get_entry_property(entry, "pKIExtendedKeyUsage", default=[])
+        extended_key_usage = list(
+            map(lambda x: OID_TO_STR_MAP[x] if x in OID_TO_STR_MAP else x, extended_key_usage)
+        )
+
+        client_authentication = (
+            any(
+                eku in extended_key_usage
+                for eku in [
+                    "Client Authentication",
+                    "Smart Card Logon",
+                    "PKINIT Client Authentication",
+                    "Any Purpose",
+                ]
+            )
+            or len(extended_key_usage) == 0
+        )
+
+        enrollment_agent = (
+            any(
+                eku in extended_key_usage
+                for eku in [
+                    "Certificate Request Agent",
+                    "Any Purpose",
+                ]
+            )
+            or len(extended_key_usage) == 0
+        )
+
+        enrollee_supplies_subject = any(
+            flag in certificate_name_flag
+            for flag in [
+                MS_PKI_CERTIFICATE_NAME_FLAG.ENROLLEE_SUPPLIES_SUBJECT,
+            ]
+        )
+
+        requires_manager_approval = (
+            MS_PKI_ENROLLMENT_FLAG.PEND_ALL_REQUESTS in enrollment_flag
+        )
+
+        security = CertificateSecurity(ADUtils.get_entry_property(entry, "nTSecurityDescriptor", raw=True))
+        aces = self.security_to_bloodhound_aces(security)
+
+        certtemplate = {
+            'Properties': {
+              'highvalue': (
+                enabled
+                and any(
+                  [
+                    all(
+                      [
+                        enrollee_supplies_subject,
+                        not requires_manager_approval,
+                        client_authentication,
+                      ]
+                    ),
+                    all([enrollment_agent, not requires_manager_approval]),
+                  ]
+                )
+              ),
+            'name': "%s@%s"
+            % (
+              ADUtils.get_entry_property(entry, "CN").upper(),
+              self.domainname.upper()
+            ),
+            'type': 'Certificate Template',
+            'domain': self.domainname.upper(),
+            'Template Name': ADUtils.get_entry_property(entry, 'CN'),
+            'Display Name': ADUtils.get_entry_property(entry, 'displayName'),
+            'Client Authentication': client_authentication,
+            'Enrollee Supplies Subject': enrollee_supplies_subject,
+            'Extended Key Usage': extended_key_usage,
+            'Requires Manager Approval': requires_manager_approval,
+            'Validity Period': validity_period,
+            'Renewal Period': renewal_period,
+            'Certificate Name Flag': certificate_name_flag.to_str_list(),
+            'Enrollment Flag': enrollment_flag.to_str_list(),
+            'Authorized Signatures Required': authorized_signatures_required,
+            'Application Policies': application_policies,
+            'Enabled': enabled,
+            'Certificate Authorities': list(self.certtemplates[name]),
+            },          
+            'ObjectIdentifier': object_identifier.lstrip("{").rstrip("}"), 
+            'Aces': aces,
+        }
+
+        self.numCertTemplates += 1
+        self.writeQueues["cert_bh"].put(certtemplate)
+        self.writeQueues["cert_ly4k_tpls"].put(certtemplate)
+        return True
+
+    def processCAs(self, entry):
+        if not 'pkienrollmentservice' in entry.classes:
+            return
+        
+        name = ADUtils.get_entry_property(entry, 'name')
+        if not name:
+            return
+        
+        object_identifier = ADUtils.get_entry_property(entry, 'objectGUID')
+        ca_name = ADUtils.get_entry_property(entry, 'cn') 
+        dns_name = ADUtils.get_entry_property(entry, 'dNSHostName')
+       
+        subject_name = ADUtils.get_entry_property(entry, 'cACertificateDN')
+
+        ca_certificate = x509.Certificate.load(
+            ADUtils.get_entry_property(entry, 'cACertificate', raw=True)
+        )["tbs_certificate"]
+
+        serial_number = hex(int(ca_certificate["serial_number"]))[2:].upper()
+
+        validity = ca_certificate["validity"].native
+        validity_start = str(validity["not_before"])
+        validity_end = str(validity["not_after"])
+
+        security = CASecurity(ADUtils.get_entry_property(entry, "nTSecurityDescriptor"))
+        aces = self.ca_security_to_bloodhound_aces(security)
+
+        cas = {
+                "Properties": {
+                    "highvalue": True,
+                    "name": "%s@%s"
+                    % (
+                        name.upper(),
+                        self.domainname.upper(),
+                    ),
+                    "domain": self.domainname.upper(),
+                    "type": "Enrollment Service",
+                    "CA Name": ca_name,
+                    "DNS Name": dns_name,
+                    "Certificate Subject": subject_name,
+                    "Certificate Serial Number": serial_number,
+                    "Certificate Validity Start": validity_start,
+                    "Certificate Validity End": validity_end,
+                    # the below values cannot be obtained from ADExplorer
+                    "Web Enrollment": "",
+                    "User Specified SAN" : "",
+                    "Request Disposition" : "",
+                },
+                "ObjectIdentifier": object_identifier.lstrip("{").rstrip("}"),
+                "Aces": aces,
+            }
+
+        self.numCAs += 1
+        self.writeQueues["cert_bh"].put(cas)
+        self.writeQueues["cert_ly4k_cas"].put(cas)
+        return True
 
     def processTrusts(self, entry):
         if 'trusteddomain' not in entry.classes:
@@ -465,6 +680,7 @@ class ADExplorerSnapshot(object):
             "Properties": {
                 "domain": self.domainname.upper(),
                 "domainsid": self.domainsid,
+                "highvalue": is_highvalue(sid),
                 "name": resolved_entry['principal'],
                 "distinguishedname": distinguishedName
             },
@@ -476,7 +692,7 @@ class ADExplorerSnapshot(object):
             group['ObjectIdentifier'] = '%s-%s' % (self.domainname.upper(), sid)
 
         group['Properties']['admincount'] = ADUtils.get_entry_property(entry, 'adminCount', default=0) == 1
-        group['Properties']['description'] = ADUtils.get_entry_property(entry, 'description')
+        group['Properties']['description'] = ADUtils.get_entry_property(entry, 'description', '')
         group['Properties']['whencreated'] = ADUtils.get_entry_property(entry, 'whencreated', default=0)
 
         for member in ADUtils.get_entry_property(entry, 'member', []):
@@ -738,6 +954,146 @@ class ADExplorerSnapshot(object):
             "IsACLProtected": False
         }
         self.writeQueues["groups"].put(iugroup)
+
+
+
+    def security_to_bloodhound_aces(self, security: ActiveDirectorySecurity) -> List:
+        aces = []
+        principal_type = ""
+
+        owner_sid = security.owner
+        if owner_sid in ADUtils.WELLKNOWN_SIDS:
+            principal = u'%s-%s' % (self.domainname.upper(), owner_sid)
+            principal_type = ADUtils.WELLKNOWN_SIDS[owner_sid][1].capitalize()
+        else:
+            try:
+                entry = self.snap.getObject(self.sidcache[owner_sid])
+                resolved_entry = ADUtils.resolve_ad_entry(entry)
+                principal_type = resolved_entry['type']
+            except KeyError:
+                entry = {
+                    'type': 'Unknown',
+                    'principal': owner_sid
+                }
+        aces.append(
+            {
+                "PrincipalSID": owner_sid,
+                "PrincipalType": principal_type,
+                "RightName": "Owner",
+                "IsInherited": False,
+            }
+        )
+
+        for sid, rights in security.aces.items():
+            principal = sid
+            principal_type = ""
+
+
+
+            if sid in ADUtils.WELLKNOWN_SIDS:
+                principal = u'%s-%s' % (self.domainname.upper(), sid)
+                principal_type = ADUtils.WELLKNOWN_SIDS[sid][1].capitalize()
+            else:
+                try:
+                    entry = self.snap.getObject(self.sidcache[sid])
+                    resolved_entry = ADUtils.resolve_ad_entry(entry)
+                    principal_type = resolved_entry['type']
+                except KeyError:
+                    entry = {
+                        'type': 'Unknown',
+                        'principal': sid
+                    }
+
+            try:
+                standard_rights = list(rights["rights"])
+            except:
+                standard_rights = rights["rights"].to_list()
+
+            for right in standard_rights:
+                aces.append(
+                    {
+                        "PrincipalSID": principal,
+                        "PrincipalType": principal_type,
+                        "RightName": str(right),
+                        "IsInherited": False,
+                    }
+                )
+
+            extended_rights = rights["extended_rights"]
+
+            for extended_right in extended_rights:
+                aces.append(
+                    {
+                        "PrincipalSID": principal,
+                        "PrincipalType": principal_type,
+                        "RightName": EXTENDED_RIGHTS_MAP[extended_right].replace(
+                            "-", ""
+                        )
+                        if extended_right in EXTENDED_RIGHTS_MAP
+                        else extended_right,
+                        "IsInherited": False,
+                    }
+                )
+
+        return aces
+
+
+    def ca_security_to_bloodhound_aces(self, security: ActiveDirectorySecurity) -> List:
+        aces = []
+        principal_type = ""
+
+        for sid, rights in security.aces.items():
+            principal = sid
+            principal_type = ""
+
+            if sid in ADUtils.WELLKNOWN_SIDS:
+                principal = u'%s-%s' % (self.domainname.upper(), sid)
+                principal_type = ADUtils.WELLKNOWN_SIDS[sid][1].capitalize()
+            else:
+                try:
+                    entry = self.snap.getObject(self.sidcache[sid])
+                    resolved_entry = ADUtils.resolve_ad_entry(entry)
+                    principal_type = resolved_entry['type']
+                except KeyError:
+                    entry = {
+                        'type': 'Unknown',
+                        'principal': sid
+                    }
+
+            try:
+                standard_rights = list(rights["rights"])
+            except:
+                standard_rights = rights["rights"].to_list()
+            
+
+            for right in standard_rights:
+                if not principal_type == "Computer":
+                    aces.append(
+                        {
+                            "PrincipalSID": principal,
+                            "PrincipalType": principal_type,
+                            "RightName": str(right),
+                            "IsInherited": False,
+                        }
+                    )
+
+            extended_rights = rights["extended_rights"]
+
+            for extended_right in extended_rights:
+                aces.append(
+                    {
+                        "PrincipalSID": principal,
+                        "PrincipalType": principal_type,
+                        "RightName": EXTENDED_RIGHTS_MAP[extended_right].replace(
+                            "-", ""
+                        )
+                        if extended_right in EXTENDED_RIGHTS_MAP
+                        else extended_right,
+                        "IsInherited": False,
+                    }
+                )
+
+        return aces
 
 def main():
 
