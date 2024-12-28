@@ -193,12 +193,12 @@ class ADExplorerSnapshot(object):
             # create sid cache
             objectSid = ADUtils.get_entry_property(obj, 'objectSid')
             if objectSid:
-                self.sidcache[objectSid] = idx
+                self.sidcache[str(objectSid)] = idx
 
             # create dn cache
             distinguishedName = ADUtils.get_entry_property(obj, 'distinguishedName')
             if distinguishedName:
-                self.dncache[distinguishedName] = idx
+                self.dncache[str(distinguishedName)] = idx
 
             # get domains
             if 'domain' in obj.classes:
@@ -206,29 +206,29 @@ class ADExplorerSnapshot(object):
                     if self.log:
                         self.log.warn("Multiple domains in snapshot(?)")
                 else:
-                    self.rootdomain = distinguishedName
-                    self.domains[distinguishedName] = idx
+                    self.rootdomain = str(distinguishedName)
+                    self.domains[str(distinguishedName)] = idx
 
             # get forest domains
             if 'crossref' in obj.classes:
                 if ADUtils.get_entry_property(obj, 'systemFlags', 0) & 2 == 2:
                     ncname = ADUtils.get_entry_property(obj, 'nCName')
                     if ncname and ncname not in self.domains:
-                        self.domains[ncname] = idx
+                        self.domains[str(ncname)] = idx
 
             # get computers
             if ADUtils.get_entry_property(obj, 'sAMAccountType', -1) == 805306369:
                 dnshostname = ADUtils.get_entry_property(obj, 'dNSHostname')
                 if dnshostname:
-                    self.computersidcache[dnshostname] = objectSid
+                    self.computersidcache[str(dnshostname)] = str(objectSid)
 
             # get all cert templates
             if 'pkienrollmentservice' in obj.classes:
-                name = ADUtils.get_entry_property(obj, 'name')
+                name = str(ADUtils.get_entry_property(obj, 'name'))
                 if ADUtils.get_entry_property(obj, 'certificateTemplates'):
                     templates = ADUtils.get_entry_property(obj, 'certificateTemplates')
                     for template in templates:
-                        self.certtemplates[template].add(name)
+                        self.certtemplates[str(template)].add(name)
 
             # get dcs
             if ADUtils.get_entry_property(obj, 'userAccountControl', 0) & 0x2000 == 0x2000:
@@ -303,7 +303,10 @@ class ADExplorerSnapshot(object):
                 "distinguishedname": ADUtils.get_entry_property(self.domain_object, 'distinguishedName'),
                 "description": ADUtils.get_entry_property(self.domain_object, 'description', ''),
                 "functionallevel": functional_level,
+                "Machine Account Quota": ADUtils.get_entry_property(self.domain_object, 'ms-DS-MachineAccountQuota'),
                 "highvalue": True,
+                "isaclprotected": False,
+                "collected": True,
                 "whencreated": ADUtils.get_entry_property(self.domain_object, 'whencreated', default=0)
             },
             "Trusts": [],
@@ -318,7 +321,8 @@ class ADExplorerSnapshot(object):
                 "PSRemoteUsers": [],
                 "RemoteDesktopUsers": []
             },
-            "IsDeleted": False
+            "IsDeleted": False,
+            "IsACLProtected": False
         }
 
         aces = self.parse_acl(domain, 'domain', ADUtils.get_entry_property(self.domain_object, 'nTSecurityDescriptor', raw=True))
@@ -349,32 +353,17 @@ class ADExplorerSnapshot(object):
             'ObjectIdentifier': ADUtils.get_entry_property(entry, 'objectsid'),
             'AllowedToAct': [],
             'PrimaryGroupSID': MembershipEnumerator.get_primary_membership(membership_entry),
-            'LocalAdmins': {
-                'Collected': False,
-                'FailureReason': None,
-                'Results': []
-            },
-            'PSRemoteUsers': {
-                'Collected': False,
-                'FailureReason': None,
-                'Results': []
-            },
+            'ContainedBy': None,
+            'DumpSMSAPassword': [],
             'Properties': {
                 'name': hostname.upper(),
                 'domainsid': self.domainsid,
                 'domain': self.domainname.upper(),
+                'highvalue': False,
                 'distinguishedname': distinguishedName
             },
-            'RemoteDesktopUsers': {
-                'Collected': False,
-                'FailureReason': None,
-                'Results': []
-            },
-            'DcomUsers': {
-                'Collected': False,
-                'FailureReason': None,
-                'Results': []
-            },
+            'LocalGroups': [],
+            'UserRights': [],
             'PrivilegedSessions': {
                 'Collected': False,
                 'FailureReason': None,
@@ -407,17 +396,17 @@ class ADExplorerSnapshot(object):
         props['haslaps'] = ADUtils.get_entry_property(entry, 'ms-mcs-admpwdexpirationtime', 0) != 0
 
         props['lastlogon'] = ADUtils.win_timestamp_to_unix(
-            ADUtils.get_entry_property(entry, 'lastlogon', default=0, raw=True)
+            ADUtils.get_entry_property(entry, 'lastlogon', default=-1, raw=True)
         )
 
         props['lastlogontimestamp'] = ADUtils.win_timestamp_to_unix(
-            ADUtils.get_entry_property(entry, 'lastlogontimestamp', default=0, raw=True)
+            ADUtils.get_entry_property(entry, 'lastlogontimestamp', default=-1, raw=True)
         )
         if props['lastlogontimestamp'] == 0:
             props['lastlogontimestamp'] = -1
 
         props['pwdlastset'] = ADUtils.win_timestamp_to_unix(
-            ADUtils.get_entry_property(entry, 'pwdLastSet', default=0, raw=True)
+            ADUtils.get_entry_property(entry, 'pwdLastSet', default=-1, raw=True)
         )
 
         props['whencreated'] = ADUtils.get_entry_property(entry, 'whencreated', default=0)
@@ -441,12 +430,20 @@ class ADExplorerSnapshot(object):
                 continue
             try:
                 sid = self.computersidcache[target]
-                computer['AllowedToDelegate'].append(sid)
+                delegateObj = {
+                    "ObjectIdentifier":sid,
+                    "ObjectType": self.resolve_sid(sid)['ObjectType']
+                }
+                computer['AllowedToDelegate'].append(delegateObj)
             except KeyError:
                 if '.' in target:
-                    computer['AllowedToDelegate'].append(target.upper())
-        if len(delegatehosts) > 0:
-            props['allowedtodelegate'] = delegatehosts
+                    self.log.warn('Unable to find sid for delegation target: %s', host)
+                    # TODO: figure out what to do here
+                    #computer['AllowedToDelegate'].append(target.upper())
+                    pass
+        # deprecated
+        #if len(delegatehosts) > 0:
+        #    props['allowedtodelegate'] = delegatehosts
 
 
         # Process resource-based constrained delegation
@@ -682,11 +679,12 @@ class ADExplorerSnapshot(object):
                 "domainsid": self.domainsid,
                 "highvalue": is_highvalue(sid),
                 "name": resolved_entry['principal'],
-                "distinguishedname": distinguishedName
+                "distinguishedname": distinguishedName,
             },
             "Members": [],
             "Aces": [],
-            "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False)
+            "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False),
+            "IsACLProtected": False,
         }
         if sid in ADUtils.WELLKNOWN_SIDS:
             group['ObjectIdentifier'] = '%s-%s' % (self.domainname.upper(), sid)
@@ -694,6 +692,7 @@ class ADExplorerSnapshot(object):
         group['Properties']['admincount'] = ADUtils.get_entry_property(entry, 'adminCount', default=0) == 1
         group['Properties']['description'] = ADUtils.get_entry_property(entry, 'description', '')
         group['Properties']['whencreated'] = ADUtils.get_entry_property(entry, 'whencreated', default=0)
+        group['Properties']['samaccountname'] = ADUtils.get_entry_property(entry, 'samaccountname')
 
         for member in ADUtils.get_entry_property(entry, 'member', []):
             resolved_member = self.get_membership(member)
@@ -730,10 +729,12 @@ class ADExplorerSnapshot(object):
             "AllowedToDelegate": [],
             "ObjectIdentifier": ADUtils.get_entry_property(entry, 'objectSid'),
             "PrimaryGroupSID": MembershipEnumerator.get_primary_membership(membership_entry),
+            "ContainedBy": None,
             "Properties": {
                 "name": resolved_entry['principal'],
                 "domain": domain.upper(),
                 "domainsid": self.domainsid,
+                "highvalue": False,
                 "distinguishedname": distinguishedName,
                 "unconstraineddelegation": ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x00080000 == 0x00080000,
                 "trustedtoauth": ADUtils.get_entry_property(entry, 'userAccountControl', default=0) & 0x01000000 == 0x01000000,
@@ -742,7 +743,8 @@ class ADExplorerSnapshot(object):
             "Aces": [],
             "SPNTargets": [],
             "HasSIDHistory": [],
-            "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False)
+            "IsDeleted": ADUtils.get_entry_property(entry, 'isDeleted', default=False),
+            "IsACLProtected": False,
         }
 
         MembershipEnumerator.add_user_properties(user, entry)
@@ -756,11 +758,20 @@ class ADExplorerSnapshot(object):
                     continue
                 try:
                     sid = self.computersidcache[target]
-                    user['AllowedToDelegate'].append(sid)
+                    delegateObj = {
+                        "ObjectIdentifier":sid,
+                        "ObjectType": self.resolve_sid(sid)['ObjectType']
+                    }
+                    
+                    user['AllowedToDelegate'].append(delegateObj)
                 except KeyError:
-                    if '.' in target:
-                        user['AllowedToDelegate'].append(target.upper())
-
+                    self.log.warn('Unable to find sid for delegation target: %s', host)
+                    #if '.' in target:
+                    #    user['AllowedToDelegate'].append(target.upper())
+                    # TODO: Figure out what to do here
+                    pass
+            # Remove bad allowedtodelegate prop
+            del user['Properties']['allowedtodelegate']
         # Parse SID history - in this case, will be all unknown(?)
         if len(user['Properties']['sidhistory']) > 0:
             for historysid in user['Properties']['sidhistory']:
@@ -874,12 +885,14 @@ class ADExplorerSnapshot(object):
             "Properties": {
                 "domain": self.domainname.upper(),
                 "domainsid": self.domainsid,
-                "name": "NT AUTHORITY@%s" % self.domainname.upper()
+                "name": "NT AUTHORITY@%s" % self.domainname.upper(),
+                "highvalue": False,
             },
             "Aces": [],
             "SPNTargets": [],
             "HasSIDHistory": [],
             "IsDeleted": False,
+            "ContainedBy": None,
             "IsACLProtected": False,
         }
         self.writeQueues["users"].put(user)
@@ -893,10 +906,12 @@ class ADExplorerSnapshot(object):
                 "domainsid": self.domainsid,
                 "name": "ENTERPRISE DOMAIN CONTROLLERS@%s" % self.domainname.upper()
             },
+            "ContainedBy": None,
             "Members": [],
             "Aces": [],
             "IsDeleted": False,
-            "IsACLProtected": False
+            "IsACLProtected": False,
+            "ContainedBy": None
         }
 
         for dc in self.domaincontrollers:
@@ -921,7 +936,8 @@ class ADExplorerSnapshot(object):
             "Members": [],
             "Aces": [],
             "IsDeleted": False,
-            "IsACLProtected": False
+            "IsACLProtected": False,
+            "ContainedBy": None
         }
         self.writeQueues["groups"].put(evgroup)
 
@@ -936,7 +952,8 @@ class ADExplorerSnapshot(object):
             "Members": [],
             "Aces": [],
             "IsDeleted": False,
-            "IsACLProtected": False
+            "IsACLProtected": False,
+            "ContainedBy": None
         }
         self.writeQueues["groups"].put(augroup)
 
@@ -951,7 +968,8 @@ class ADExplorerSnapshot(object):
             "Members": [],
             "Aces": [],
             "IsDeleted": False,
-            "IsACLProtected": False
+            "IsACLProtected": False,
+            "ContainedBy": None
         }
         self.writeQueues["groups"].put(iugroup)
 

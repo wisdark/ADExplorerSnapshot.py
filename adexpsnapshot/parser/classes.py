@@ -78,9 +78,6 @@ class AttributeDict(UserDict):
         self.raw = raw
 
         self._dico = CaseInsensitiveDict()
-
-        self.getAttribute = functools.lru_cache()(self.getAttribute)
-
         
     def __getitem__(self,  key):
         ret = self.getAttribute(key, raw=self.raw)
@@ -186,8 +183,8 @@ class AttributeDict(UserDict):
                 values.append(descriptorBytes)
 
         else:
-            if self.log:
-                self.log.warn("Unhandled adsType: %s -> %d" % (attrName, attrType))
+            if self.snap.log:
+                self.snap.log.warn("Unhandled adsType: %s -> %d" % (attrName, attrType))
 
         return values
 
@@ -201,13 +198,17 @@ class Object(WrapStruct):
         self.attributes = AttributeDict(self, raw=False)
         self.raw_attributes = AttributeDict(self, raw=True)
 
-        self.getObjectClasses = functools.lru_cache()(self.getObjectClasses)
-        self.getObjectCategory = functools.lru_cache()(self.getObjectCategory)
+    @functools.cached_property
+    def classes(self):
+        try:
+            return list(map(str.casefold, self.attributes.get('objectClass', [])))
+        except Exception as e:
+            print("Error in resolving objectClass:")
+            print(e)
+        return []
 
-    def getObjectClasses(self):
-        return list(map(str.casefold, self.attributes.get('objectClass', [])))
-
-    def getObjectCategory(self):
+    @functools.cached_property
+    def category(self):
         catDN = self.attributes.get('objectCategory', None)
         if catDN is None:
             return None
@@ -218,9 +219,6 @@ class Object(WrapStruct):
             return catObj.className.lower()
         else:
             return None
-
-    classes = property(getObjectClasses)
-    category = property(getObjectCategory)
 
     # for easy compatibility with the bloodhound lib
     def __getitem__(self, key):

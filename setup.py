@@ -15,21 +15,23 @@ setup(name='ADExplorerSnapshot',
                 'adexpsnapshot.parser',
       ],
       license='MIT',
-      install_requires=['bloodhound>=1.7.2','dissect.cstruct>=2.0','frozendict','requests','pwntools>=4.5.0','certipy-ad>=4.4.0'],
+      install_requires=['bloodhound @ git+https://github.com/dirkjanm/BloodHound.py@bloodhound-ce','dissect.cstruct>=2.0','frozendict','requests','pwntools>=4.5.0','certipy-ad>=4.4.0'],
       classifiers=[
         'Environment :: Console',
         'Intended Audience :: Information Technology',
         'Intended Audience :: Science/Research',
         'Intended Audience :: System Administrators',
         'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
         'Topic :: Security'
       ],
       entry_points= {
         'console_scripts': ['ADExplorerSnapshot.py=adexpsnapshot:main']
       },
-      python_requires='>=3.6'
+      python_requires='>=3.8'
 )

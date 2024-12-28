@@ -1,6 +1,6 @@
 # ADExplorerSnapshot.py
 
-![Python 3.6+ compatible](https://img.shields.io/badge/python-%5E3.6-blue)
+![Python 3.8+ compatible](https://img.shields.io/badge/python-%5E3.8-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ADExplorerSnapshot.py is an AD Explorer snapshot parser. It is made as an ingestor for [BloodHound](https://bloodhound.readthedocs.io/), and also supports full-object dumping to NDJSON.
@@ -26,7 +26,7 @@ The ingestor for BloodHound only supports offline information collection from th
 
 ## Installation
 
-ADExplorerSnapshot.py supports Python 3.6+. Dependencies are managed via pip.
+ADExplorerSnapshot.py supports Python 3.8+. Dependencies are managed via pip.
 
 ```
 git clone https://github.com/c3c/ADExplorerSnapshot.py.git
@@ -63,7 +63,7 @@ If you use ly4k's fork, you should import the `cert_ly4k` files instead. Some in
 
 ## Notes
 
-This library is now supporting the BloodHound v4.2+ output format (JSON format v4). Version 4.1 and below are no longer supported.
+This library is now supporting the BloodHound v6 output format. Older versions were supported in earlier commmits if you still need them.
 For the old v3 output format, you can use the code in the [v3-format branch](https://github.com/c3c/ADExplorerSnapshot.py/tree/v3-format).
 
 Making snapshots in AD Explorer is more network-intensive than the traditional BloodHound ingestors as it attempts to retrieve all objects it can from the LDAP.
@@ -95,5 +95,6 @@ Credits:
  - Cedric Van Bockhaven for implementation
  - Marat Nigmatullin for the idea
  - The FalconForce team for adding certificate template support
+ - Oddvar Moe (@api0cradle) for contributing various scripts
 
 Thanks to Deloitte for providing the environment in which this tool was developed.
