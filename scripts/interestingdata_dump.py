@@ -2,12 +2,13 @@
 # author: @oddvarmoe
 
 from adexpsnapshot import ADExplorerSnapshot
-import pwnlib.term, pwnlib.log, logging
+from rich.progress import track
 from bloodhound.ad.utils import ADUtils
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import argparse
 import os
+import logging
 
 def valid_directory(path):
     """Check if the provided path is a valid directory or create it if it does not exist."""
@@ -37,16 +38,7 @@ parser.add_argument("snapshot", type=argparse.FileType("rb"), help="Path to the 
 parser.add_argument("-o", "--output_folder", required=True, type=valid_directory, help="Folder to save output to")
 args = parser.parse_args()
 
-logging.basicConfig(handlers=[pwnlib.log.console])
-log = pwnlib.log.getLogger(__name__)
-log.setLevel(20)
-
-if pwnlib.term.can_init():
-    pwnlib.term.init()
-
-log.term_mode = pwnlib.term.term_mode
-
-ades = ADExplorerSnapshot(args.snapshot, ".", log)
+ades = ADExplorerSnapshot(args.snapshot, ".")
 ades.preprocessCached()
 
 # Get snapshot time
@@ -69,6 +61,10 @@ out_plaintextpwd = []
 out_pwdnotreqd = []
 out_precreated = []
 out_sql_systems = []
+out_technologies = []
+
+# Technology variables
+technologies_sccm = False
 
 # Attributes to check for plaintext passwords
 plaintext_pwd_attributes = ['UserPassword','UnixUserPassword','unicodePwd','msSFU30Password','orclCommonAttribute','os400Password']
@@ -91,9 +87,9 @@ out_plaintextpwd.append("samaccountname||distinguishedName||attribute")
 out_pwdnotreqd.append("samaccountname||distinguishedName||useraccountcontrol||logoncount")
 out_precreated.append("samaccountname||useraccountcontrol||pwdlastset||whencreated||description")
 out_sql_systems.append("samaccountname||dnshostname||operatingsystem||operatingsystemversion||description||lastlogontimestamp")
+out_technologies.append("technology||notes")
 
-prog = log.progress(f"Going through objects and outputting to files", rate=0.1)    
-for idx,obj in enumerate(ades.snap.objects):
+for idx, obj in track(enumerate(ades.snap.objects), description="Processing objects", total=ades.snap.header.numObjects):
     # get computers
     object_resolved = ADUtils.resolve_ad_entry(obj)
     if object_resolved['type'] == 'Computer':
@@ -131,6 +127,7 @@ for idx,obj in enumerate(ades.snap.objects):
         if ms_mcs_admpwd:
             ms_mcs_admpwdexpirationtime = ADUtils.get_entry_property(obj, 'ms-Mcs-AdmPwdExpirationTime')
             out_laps.append(f"{dnshostname}||{ms_mcs_admpwd}||{ms_mcs_admpwdexpirationtime}")
+            out_technologies.append("LAPS||Check laps.txt")
         
         # Check for asreproast
         if useraccountcontrol is not None and useraccountcontrol & 4194304:
@@ -210,6 +207,8 @@ for idx,obj in enumerate(ades.snap.objects):
             mssmssitecode = ADUtils.get_entry_property(obj, 'mssmssitecode')
             mssmsversion = ADUtils.get_entry_property(obj, 'mssmsversion')
             out_sccm.append(f"{mssmsmpname}||{dnshostname}||{distinguishedname}||{mssmssitecode}||{mssmsversion}")
+            technologies_sccm = True
+            
         # get printers
         if "printQueue" in ADUtils.get_entry_property(obj, 'objectClass', "0"):
             name = ADUtils.get_entry_property(obj, 'name')
@@ -228,9 +227,9 @@ for idx,obj in enumerate(ades.snap.objects):
             distinguishedname = ADUtils.get_entry_property(obj, 'distinguishedname')
             out_shares.append(f"{name}||{uncname}||{distinguishedname}")
 
-    prog.status(f"{idx+1}/{ades.snap.header.numObjects}")
-
-
+    technologies_adcs = True if 'pkicertificatetemplate' in obj.classes else False
+    technologies_exchange = True if 'msexchexchangeserver' in obj.classes else False
+    technologies_adfs = True if 'deviceregistrationservice' in obj.classes else False
 
 if args.output_folder:
     if out_computers:
@@ -296,5 +295,17 @@ if args.output_folder:
     if out_sql_systems:
         outFile_sql_systems = open(Path(args.output_folder / "sql_systems.txt"), "w")
         outFile_sql_systems.write(os.linesep.join(out_sql_systems))
+        
+    if out_technologies:
+        outFile_technologies = open(Path(args.output_folder / "technologies.txt"), "w")
+        if technologies_sccm == True:
+            out_technologies.append("SCCM||Check sccm.txt")
+        if technologies_adcs == True:
+            out_technologies.append("ADCS||ADCS Container found (run cert_dump script)")
+        if technologies_exchange == True:
+            out_technologies.append("Exchange||Local Exchange server")
+        if technologies_adfs == True:
+            out_technologies.append("ADFS||ADFS is installed")
+        outFile_technologies.write(os.linesep.join(out_technologies))
 
-    log.info(f"Output written to files in {args.output_folder}")
+    logging.info(f"Output written to files in {args.output_folder}")

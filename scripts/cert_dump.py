@@ -2,15 +2,16 @@
 # author: @oddvarmoe
 
 from adexpsnapshot import ADExplorerSnapshot
-import pwnlib.term, pwnlib.log, logging
+from rich.progress import track
 from bloodhound.ad.utils import ADUtils
 from datetime import datetime, timedelta, timezone
 from certipy.lib.constants import *
-from certipy.lib.security import ActiveDirectorySecurity, CertifcateSecurity as CertificateSecurity, CASecurity
+from certipy.lib.security import ActiveDirectorySecurity, CertificateSecurity as CertificateSecurity, CASecurity
 from certipy.commands.find import filetime_to_str
 from pathlib import Path
 import argparse
 import os
+import logging
 from typing import List
 
 def valid_directory(path):
@@ -35,16 +36,8 @@ parser.add_argument("-o", "--output_folder", required=True, type=valid_directory
 parser.add_argument("-e", "--enabled", required=False, help="Only get enabled templates", action="store_true")
 args = parser.parse_args()
 
-logging.basicConfig(handlers=[pwnlib.log.console])
-log = pwnlib.log.getLogger(__name__)
-log.setLevel(20)
-
-if pwnlib.term.can_init():
-    pwnlib.term.init()
-
-log.term_mode = pwnlib.term.term_mode
-
-ades = ADExplorerSnapshot(args.snapshot, ".", log)
+# Console will be automatically initialized with setup_logging() when omitted
+ades = ADExplorerSnapshot(args.snapshot, ".")
 ades.preprocessCached()
 
 # Get snapshot time
@@ -64,7 +57,7 @@ def security_to_bloodhound_aces(security: ActiveDirectorySecurity) -> List:
         if owner_sid in ADUtils.WELLKNOWN_SIDS:
             principal = u'%s-%s' % (ADUtils.ldap2domain(ades.rootdomain).upper(), owner_sid)
             principal_type = ADUtils.WELLKNOWN_SIDS[owner_sid][1].capitalize()
-            principal_accountname = ADUtils.WELLKNOWN_SIDS[sid][0]
+            principal_accountname = ADUtils.WELLKNOWN_SIDS[owner_sid][0]
         else:
             try:
                 entry = ades.snap.getObject(ades.sidcache[owner_sid])
@@ -87,8 +80,6 @@ def security_to_bloodhound_aces(security: ActiveDirectorySecurity) -> List:
         for sid, rights in security.aces.items():
             principal = sid
             principal_type = ""
-
-
 
             if sid in ADUtils.WELLKNOWN_SIDS:
                 principal = u'%s-%s' % (ADUtils.ldap2domain(ades.rootdomain).upper(), sid)
@@ -139,10 +130,9 @@ def security_to_bloodhound_aces(security: ActiveDirectorySecurity) -> List:
 
         return aces
 
-prog = log.progress(f"Going through objects and outputting to files", rate=0.1)
 domainname = ADUtils.ldap2domain(ades.rootdomain).upper()
 
-for idx,obj in enumerate(ades.snap.objects):
+for idx, obj in track(enumerate(ades.snap.objects), description="Processing objects", total=ades.snap.header.numObjects):
     object_resolved = ADUtils.resolve_ad_entry(obj)
     
     if 'pkicertificatetemplate' in obj.classes:
@@ -160,10 +150,10 @@ for idx,obj in enumerate(ades.snap.objects):
         schema_version = ADUtils.get_entry_property(obj, 'msPKI-Template-Schema-Version', 0)
 
         certificate_name_flag = ADUtils.get_entry_property(obj, 'msPKI-Certificate-Name-Flag', 0)
-        certificate_name_flag = MS_PKI_CERTIFICATE_NAME_FLAG(int(certificate_name_flag))
+        certificate_name_flag = CertificateNameFlag(int(certificate_name_flag))
 
         enrollment_flag = ADUtils.get_entry_property(obj, 'msPKI-Enrollment-Flag', 0)
-        enrollment_flag = MS_PKI_ENROLLMENT_FLAG(int(enrollment_flag))
+        enrollment_flag = EnrollmentFlag(int(enrollment_flag))
 
         authorized_signatures_required = int(ADUtils.get_entry_property(obj, 'msPKI-RA-Signature', 0))
 
@@ -207,12 +197,12 @@ for idx,obj in enumerate(ades.snap.objects):
         enrollee_supplies_subject = any(
             flag in certificate_name_flag
             for flag in [
-                MS_PKI_CERTIFICATE_NAME_FLAG.ENROLLEE_SUPPLIES_SUBJECT,
+                CertificateNameFlag.ENROLLEE_SUPPLIES_SUBJECT,
             ]
         )
 
         requires_manager_approval = (
-            MS_PKI_ENROLLMENT_FLAG.PEND_ALL_REQUESTS in enrollment_flag
+            EnrollmentFlag.PEND_ALL_REQUESTS in enrollment_flag
         )
 
         security = CertificateSecurity(ADUtils.get_entry_property(obj, "nTSecurityDescriptor", raw=True))
@@ -284,11 +274,9 @@ for idx,obj in enumerate(ades.snap.objects):
             out_certs.append(f"{ace}")
         out_certs.append("\n")
 
-    prog.status(f"{idx+1}/{ades.snap.header.numObjects}")
-
 if args.output_folder:
     if out_certs:
         outFile_certs = open(Path(args.output_folder / "certs.txt"), "w")
         outFile_certs.write(os.linesep.join(out_certs))
 
-    log.info(f"Output written to files in {args.output_folder}")
+    logging.info(f"Output written to files in {args.output_folder}")

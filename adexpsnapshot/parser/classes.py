@@ -5,6 +5,7 @@ from requests.structures import CaseInsensitiveDict
 
 import struct
 from collections import UserDict
+import logging
 
 import functools
 import uuid
@@ -45,7 +46,6 @@ class WrapStruct(object):
     def __init__(self, snap, in_obj=None):
         self.snap = snap
         self.fh = snap.fh
-        self.log = snap.log
 
         if in_obj:
             self._data = in_obj
@@ -124,7 +124,7 @@ class AttributeDict(UserDict):
         # https://docs.microsoft.com/en-us/windows/win32/api/iads/ns-iads-adsvalue
         # https://docs.microsoft.com/en-us/windows/win32/adsi/adsi-simple-data-types
 
-        if attrType in [ADSTYPE_DN_STRING, ADSTYPE_CASE_IGNORE_STRING, ADSTYPE_CASE_IGNORE_STRING, ADSTYPE_PRINTABLE_STRING, ADSTYPE_NUMERIC_STRING, ADSTYPE_OBJECT_CLASS]:
+        if attrType in [ADSTYPE_DN_STRING, ADSTYPE_CASE_EXACT_STRING, ADSTYPE_CASE_IGNORE_STRING, ADSTYPE_PRINTABLE_STRING, ADSTYPE_NUMERIC_STRING, ADSTYPE_OBJECT_CLASS]:
             offsets = structure.uint32[numValues](self.fh)
 
             for v in range(numValues):
@@ -142,16 +142,14 @@ class AttributeDict(UserDict):
                 if not raw:
                     if len(octetStr) == 16 and attrName.endswith("guid"):
                         val = str(uuid.UUID(bytes_le=octetStr))
-                    elif attrName == 'objectsid':
+                    elif attrName == 'objectsid' or attrName == 'securityidentifier':
                         val = str(LdapSid(BytesIO(octetStr)))
 
                 values.append(val)
 
         elif attrType == ADSTYPE_BOOLEAN:
-            assert numValues == 1, ["Multiple boolean values, verify data size", self.fileOffset, attrName]
-
             for v in range(numValues):
-                val = bool(structure.uint32(self.fh)) # not sure if uint32 is correct type here, check against more data sets
+                val = bool(structure.uint32(self.fh))
                 values.append(val)
 
         elif attrType == ADSTYPE_INTEGER:
@@ -183,8 +181,7 @@ class AttributeDict(UserDict):
                 values.append(descriptorBytes)
 
         else:
-            if self.snap.log:
-                self.snap.log.warn("Unhandled adsType: %s -> %d" % (attrName, attrType))
+            logging.warning("Unhandled adsType: %s -> %d" % (attrName, attrType))
 
         return values
 
@@ -250,13 +247,11 @@ class Header(WrapStruct):
         super().__init__(snap, in_obj)
 
         self.server = self.server.rstrip('\x00')
-        self.mappingOffset = (self.fileoffsetHigh << 32) | self.fileoffsetLow
         self.filetimeUnix = ADUtils.win_timestamp_to_unix(self.filetime)
 
 class Snapshot(object):
-    def __init__(self, fh, log=None):
+    def __init__(self, fh):
         self.fh = fh
-        self.log = log
         self.objectOffsets = {}
 
         # the order in which we're parsing matters, due to the file handle's position
@@ -272,14 +267,10 @@ class Snapshot(object):
         self.fh.seek(0)
         self.header = Header(self)
 
-    def parseObjectOffsets(self):
+    def parseObjectOffsetsGenerator(self):
         self.fh.seek(0x43e)
 
         # we are only keeping offsets at this stage, as some databases grow very big
-
-        if self.log:
-            prog = self.log.progress(f"Parsing object offsets", rate=0.1)
-
         self.objectOffsets = []
         for i in range(self.header.numObjects):
             pos = self.fh.tell()
@@ -289,12 +280,11 @@ class Snapshot(object):
             # using struct instead of dissect.cstruct here for speed
             #self.objectOffsets.append(Object(self).fileOffset)
             self.fh.seek(pos+objSize)
+            yield i
 
-            if self.log and self.log.term_mode:
-                prog.status(f"{i+1}/{self.header.numObjects}")
-
-        if self.log:
-            prog.success(f"{len(self.objectOffsets)}")
+    def parseObjectOffsets(self):
+        list(self.parseObjectOffsetsGenerator())
+        logging.info(f"Parsed {len(self.objectOffsets)} object offsets")
 
     def getObject(self, i):
         self.fh.seek(self.objectOffsets[i])
@@ -309,10 +299,7 @@ class Snapshot(object):
     objects = property(getObjects)
 
     def parseProperties(self):
-        if self.log:
-            prog = self.log.progress("Parsing properties")
-
-        self.fh.seek(self.header.mappingOffset)
+        self.fh.seek(self.header.metadataOffset)
 
         properties_with_header = structure.Properties(self.fh)
         self.properties = []
@@ -327,13 +314,9 @@ class Snapshot(object):
             self.propertyDict[prop.DN] = idx
             self.propertyDict[prop.DN.split(',')[0].split('=')[1]] = idx
 
-        if self.log:
-            prog.success(str(properties_with_header.numProperties))
+        logging.info(f"Parsed {len(self.properties)} properties")
 
     def parseClasses(self):
-        if self.log:
-            prog = self.log.progress("Parsing classes")
-
         classes_with_header = structure.Classes(self.fh)
         self.classes = CaseInsensitiveDict()
         for c in classes_with_header.classes:
@@ -344,15 +327,10 @@ class Snapshot(object):
             self.classes[cl.DN] = cl
             self.classes[cl.DN.split(',')[0].split('=')[1]] = cl
 
-        if self.log:
-            prog.success(str(classes_with_header.numClasses))
+        logging.info(f"Parsed {len(self.classes)} classes")
 
     def parseRights(self):
-        if self.log:
-            prog = self.log.progress("Parsing rights")
-
         rights_with_header = structure.Rights(self.fh)
         self.rights = rights_with_header.rights
 
-        if self.log:
-            prog.success(str(rights_with_header.numRights))
+        logging.info(f"Parsed {len(self.rights)} rights")
